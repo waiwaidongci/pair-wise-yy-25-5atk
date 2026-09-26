@@ -83,13 +83,34 @@ class CorpusDB:
               created_at TEXT NOT NULL,
               UNIQUE(item_id, annotator_id, guideline_id)
             );
+            CREATE TABLE IF NOT EXISTS arbitration_rounds (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+              round_no INTEGER NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('voting','split','resolved','voided')),
+              created_at TEXT NOT NULL,
+              resolved_at TEXT,
+              UNIQUE(item_id, round_no)
+            );
+            CREATE TABLE IF NOT EXISTS arbitration_votes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              round_id INTEGER NOT NULL REFERENCES arbitration_rounds(id) ON DELETE CASCADE,
+              arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+              proposed_label TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              stage TEXT NOT NULL CHECK(stage IN ('primary','review')),
+              created_at TEXT NOT NULL,
+              UNIQUE(round_id, arbitrator_id)
+            );
             CREATE TABLE IF NOT EXISTS adjudications (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               item_id INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
               guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+              round_id INTEGER NOT NULL REFERENCES arbitration_rounds(id),
               final_label TEXT NOT NULL,
               reason TEXT NOT NULL,
-              arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+              method TEXT NOT NULL CHECK(method IN ('unanimous','review')),
+              arbitrator_id INTEGER REFERENCES users(id),
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS discussions (
@@ -125,7 +146,9 @@ class CorpusDB:
             return
         a1 = self.add_user("标注员甲", "annotator")
         a2 = self.add_user("标注员乙", "annotator")
-        arb = self.add_user("仲裁员", "arbitrator")
+        self.add_user("仲裁员甲", "arbitrator")
+        self.add_user("仲裁员乙", "arbitrator")
+        self.add_user("仲裁员丙", "arbitrator")
         guideline = self.add_guideline("v1", "标签仅可为 正向/负向/中性；先独立标注，不得查看他人答案。")
         batch = self.create_batch("情感标注示例", guideline)
         item1 = self.add_item(batch, 1, "这个更新让工作流畅了很多。")
@@ -208,8 +231,12 @@ class CorpusDB:
             raise DomainError("只能提交已分配条目的标注")
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能修改标注")
+        existing = self.conn.execute(
+            "SELECT label FROM annotations WHERE item_id=? AND annotator_id=? AND guideline_id=?",
+            (item_id, annotator_id, item["guideline_id"]),
+        ).fetchone()
+        label_changed = existing is None or existing["label"] != label.strip()
         with self.transaction():
-            self.conn.execute("DELETE FROM adjudications WHERE item_id=?", (item_id,))
             try:
                 cur = self.conn.execute(
                     "INSERT INTO annotations(item_id,annotator_id,guideline_id,label,comment,created_at) VALUES(?,?,?,?,?,?)",
@@ -227,7 +254,17 @@ class CorpusDB:
             else:
                 annotation_id = int(cur.lastrowid)
             self.conn.execute("UPDATE assignments SET status='submitted' WHERE id=?", (assignment["id"],))
+            if label_changed:
+                # 标注发生变化，此前的表决与最终结论全部作废，需要重新发起双人表决
+                self._void_rounds(item_id)
         return int(annotation_id)
+
+    def _void_rounds(self, item_id: int) -> None:
+        self.conn.execute("DELETE FROM adjudications WHERE item_id=?", (item_id,))
+        self.conn.execute(
+            "UPDATE arbitration_rounds SET status='voided' WHERE item_id=? AND status IN ('voting','split','resolved')",
+            (item_id,),
+        )
 
     def add_discussion(self, item_id: int, author_id: int, body: str, contains_answer: bool = False) -> int:
         if not body.strip():
@@ -266,6 +303,13 @@ class CorpusDB:
         payload = dict(item)
         payload["own_annotation"] = dict(own) if own else None
         payload["discussions"] = discussions
+        payload["arbitration"] = self._active_round_state(item_id)
+        final = self.conn.execute(
+            "SELECT a.id,a.final_label,a.reason,a.method,a.round_id,a.created_at,u.name AS reviewer_name "
+            "FROM adjudications a LEFT JOIN users u ON u.id=a.arbitrator_id WHERE a.item_id=?",
+            (item_id,),
+        ).fetchone()
+        payload["final_adjudication"] = dict(final) if final else None
         return payload
 
     def disagreements(self, batch_id: int) -> list[dict]:
@@ -280,15 +324,37 @@ class CorpusDB:
                 (item["id"], batch["guideline_id"]),
             ).fetchall()
             labels = {row["label"] for row in rows}
-            adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
-            if len(rows) >= 2 and len(labels) > 1 and not adj:
+            has_final = self.conn.execute("SELECT 1 FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+            if len(rows) >= 2 and len(labels) > 1 and not has_final:
                 result.append({
                     "item_id": item["id"], "ordinal": item["ordinal"], "text": item["text"],
                     "labels": [dict(row) for row in rows],
+                    "arbitration": self._active_round_state(item["id"]),
                 })
         return result
 
-    def adjudicate(self, item_id: int, final_label: str, reason: str, arbitrator_id: int) -> int:
+    def _active_round_state(self, item_id: int) -> dict | None:
+        round_row = self.conn.execute(
+            "SELECT * FROM arbitration_rounds WHERE item_id=? AND status IN ('voting','split') ORDER BY round_no DESC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        if not round_row:
+            return None
+        votes = self.conn.execute(
+            "SELECT v.id,v.arbitrator_id,u.name AS arbitrator_name,v.proposed_label,v.reason,v.stage,v.created_at "
+            "FROM arbitration_votes v JOIN users u ON u.id=v.arbitrator_id "
+            "WHERE v.round_id=? ORDER BY v.id",
+            (round_row["id"],),
+        ).fetchall()
+        return {
+            "round_id": round_row["id"],
+            "round_no": round_row["round_no"],
+            "status": round_row["status"],
+            "votes": [dict(v) for v in votes],
+        }
+
+    def cast_vote(self, item_id: int, proposed_label: str, reason: str, arbitrator_id: int) -> dict:
+        """两名仲裁员分别投票；一致即出最终结论，分歧则等第三名仲裁员复核。"""
         user = self.conn.execute("SELECT role FROM users WHERE id=?", (arbitrator_id,)).fetchone()
         item = self.conn.execute(
             "SELECT i.*,b.guideline_id,b.status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
@@ -299,24 +365,127 @@ class CorpusDB:
             raise DomainError("冻结批次不能重新仲裁")
         rows = self.conn.execute("SELECT label FROM annotations WHERE item_id=?", (item_id,)).fetchall()
         if len(rows) < 2:
-            raise DomainError("至少需要两份标注才能仲裁")
-        if not final_label.strip() or len(reason.strip()) < 5:
-            raise DomainError("最终标签必填，仲裁理由至少5个字符")
+            raise DomainError("至少需要两份标注才能发起仲裁表决")
+        if not proposed_label.strip() or len(reason.strip()) < 5:
+            raise DomainError("结论标签必填，仲裁理由至少5个字符")
         with self.transaction():
-            try:
+            if self.conn.execute("SELECT 1 FROM adjudications WHERE item_id=?", (item_id,)).fetchone():
+                raise DomainError("该争议已有最终结论；标注变更后才会重新发起表决")
+            round_row = self.conn.execute(
+                "SELECT * FROM arbitration_rounds WHERE item_id=? AND status IN ('voting','split') ORDER BY round_no DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            now = datetime.now().isoformat()
+            if round_row is None:
+                next_no = self.conn.execute(
+                    "SELECT COALESCE(MAX(round_no),0)+1 FROM arbitration_rounds WHERE item_id=?", (item_id,)
+                ).fetchone()[0]
                 cur = self.conn.execute(
-                    "INSERT INTO adjudications(item_id,guideline_id,final_label,reason,arbitrator_id,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, item["guideline_id"], final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat()),
+                    "INSERT INTO arbitration_rounds(item_id,round_no,status,created_at) VALUES(?,?,'voting',?)",
+                    (item_id, next_no, now),
                 )
-            except sqlite3.IntegrityError:
-                cur = self.conn.execute(
-                    "UPDATE adjudications SET final_label=?,reason=?,arbitrator_id=?,created_at=? WHERE item_id=?",
-                    (final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat(), item_id),
-                )
-                adjudication_id = self.conn.execute("SELECT id FROM adjudications WHERE item_id=?", (item_id,)).fetchone()["id"]
+                round_id = int(cur.lastrowid)
+                stage = "primary"
             else:
-                adjudication_id = int(cur.lastrowid)
-        return int(adjudication_id)
+                round_id = round_row["id"]
+                stage = "review" if round_row["status"] == "split" else "primary"
+            if stage == "review":
+                prior = self.conn.execute(
+                    "SELECT arbitrator_id,proposed_label FROM arbitration_votes WHERE round_id=? AND stage='primary'",
+                    (round_id,),
+                ).fetchall()
+                prior_ids = {row["arbitrator_id"] for row in prior}
+                if arbitrator_id in prior_ids:
+                    raise DomainError("复核必须由未参与首轮表决的第三名仲裁员进行")
+                options = {row["proposed_label"] for row in prior}
+                if proposed_label.strip() not in options:
+                    raise DomainError("复核结论必须从首轮两份分歧意见中选择其一")
+            elif self.conn.execute(
+                "SELECT COUNT(*) FROM arbitration_votes WHERE round_id=? AND stage='primary'", (round_id,)
+            ).fetchone()[0] >= 2:
+                raise DomainError("首轮表决已满两票，意见分歧时请由第三名仲裁员复核")
+            if self.conn.execute(
+                "SELECT 1 FROM arbitration_votes WHERE round_id=? AND arbitrator_id=?", (round_id, arbitrator_id)
+            ).fetchone():
+                raise DomainError("同一仲裁员在一轮表决中只能投一票")
+            cur = self.conn.execute(
+                "INSERT INTO arbitration_votes(round_id,arbitrator_id,proposed_label,reason,stage,created_at) VALUES(?,?,?,?,?,?)",
+                (round_id, arbitrator_id, proposed_label.strip(), reason.strip(), stage, now),
+            )
+            vote_id = int(cur.lastrowid)
+            primary_votes = self.conn.execute(
+                "SELECT v.*,u.name AS arbitrator_name FROM arbitration_votes v JOIN users u ON u.id=v.arbitrator_id "
+                "WHERE v.round_id=? AND v.stage='primary' ORDER BY v.id",
+                (round_id,),
+            ).fetchall()
+            result: dict = {"vote_id": vote_id, "round_id": round_id, "resolved": False}
+            if stage == "primary":
+                if len(primary_votes) < 2:
+                    result["status"] = "voting"
+                elif primary_votes[0]["proposed_label"] == primary_votes[1]["proposed_label"]:
+                    adjudication_id = self._create_unanimous_adjudication(item, round_id, primary_votes, now)
+                    result.update({"status": "resolved", "resolved": True, "method": "unanimous",
+                                   "adjudication_id": adjudication_id,
+                                   "final_label": primary_votes[0]["proposed_label"]})
+                else:
+                    self.conn.execute("UPDATE arbitration_rounds SET status='split' WHERE id=?", (round_id,))
+                    result["status"] = "split"
+            else:
+                review_vote = self.conn.execute(
+                    "SELECT v.*,u.name AS arbitrator_name FROM arbitration_votes v JOIN users u ON u.id=v.arbitrator_id "
+                    "WHERE v.round_id=? AND v.stage='review' ORDER BY v.id DESC LIMIT 1",
+                    (round_id,),
+                ).fetchone()
+                adjudication_id = self._create_review_adjudication(item, round_id, primary_votes, review_vote, now)
+                result.update({"status": "resolved", "resolved": True, "method": "review",
+                               "adjudication_id": adjudication_id, "final_label": review_vote["proposed_label"]})
+            return result
+
+    def _create_unanimous_adjudication(self, item, round_id: int, votes, now: str) -> int:
+        reason = "两名仲裁员一致：" + "；".join(f"{v['arbitrator_name']}：{v['reason']}" for v in votes)
+        cur = self.conn.execute(
+            "INSERT INTO adjudications(item_id,guideline_id,round_id,final_label,reason,method,arbitrator_id,created_at) "
+            "VALUES(?,?,?,?,?,'unanimous',NULL,?)",
+            (item["id"], item["guideline_id"], round_id, votes[0]["proposed_label"], reason, now),
+        )
+        self.conn.execute(
+            "UPDATE arbitration_rounds SET status='resolved',resolved_at=? WHERE id=?", (now, round_id)
+        )
+        return int(cur.lastrowid)
+
+    def _create_review_adjudication(self, item, round_id: int, primary_votes, review_vote, now: str) -> int:
+        detail = "；".join(f"{v['arbitrator_name']}：{v['proposed_label']}（{v['reason']}）" for v in primary_votes)
+        reason = f"首轮意见分歧（{detail}）；复核仲裁员{review_vote['arbitrator_name']}裁定：{review_vote['reason']}"
+        cur = self.conn.execute(
+            "INSERT INTO adjudications(item_id,guideline_id,round_id,final_label,reason,method,arbitrator_id,created_at) "
+            "VALUES(?,?,?,?,?,'review',?,?)",
+            (item["id"], item["guideline_id"], round_id, review_vote["proposed_label"], reason,
+             review_vote["arbitrator_id"], now),
+        )
+        self.conn.execute(
+            "UPDATE arbitration_rounds SET status='resolved',resolved_at=? WHERE id=?", (now, round_id)
+        )
+        return int(cur.lastrowid)
+
+    def arbitration_history(self, item_id: int) -> dict:
+        if not self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone():
+            raise DomainError("条目不存在")
+        rounds = []
+        for round_row in self.conn.execute(
+            "SELECT * FROM arbitration_rounds WHERE item_id=? ORDER BY round_no", (item_id,)
+        ).fetchall():
+            votes = [dict(v) for v in self.conn.execute(
+                "SELECT v.id,v.arbitrator_id,u.name AS arbitrator_name,v.proposed_label,v.reason,v.stage,v.created_at "
+                "FROM arbitration_votes v JOIN users u ON u.id=v.arbitrator_id "
+                "WHERE v.round_id=? ORDER BY v.id",
+                (round_row["id"],),
+            ).fetchall()]
+            adj = self.conn.execute(
+                "SELECT id,final_label,reason,method,arbitrator_id,created_at FROM adjudications WHERE round_id=?",
+                (round_row["id"],),
+            ).fetchone()
+            rounds.append({**dict(round_row), "votes": votes, "adjudication": dict(adj) if adj else None})
+        return {"item_id": item_id, "rounds": rounds}
 
     def consistency(self, batch_id: int) -> dict:
         batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
@@ -368,8 +537,19 @@ class CorpusDB:
         if not items:
             raise DomainError("空批次不能冻结")
         disagreements = self.disagreements(batch_id)
-        if disagreements:
-            raise DomainError(f"仍有 {len(disagreements)} 条分歧未仲裁")
+        pending = [d["item_id"] for d in disagreements if d["arbitration"] is not None]
+        if pending:
+            raise DomainError(f"仍有 {len(pending)} 条争议的双人表决未出最终结论: {pending}")
+        unresolved = [d["item_id"] for d in disagreements]
+        if unresolved:
+            raise DomainError(f"仍有 {len(unresolved)} 条分歧未仲裁: {unresolved}")
+        open_rounds = [row[0] for row in self.conn.execute(
+            "SELECT i.id FROM arbitration_rounds r JOIN items i ON i.id=r.item_id "
+            "WHERE i.batch_id=? AND r.status IN ('voting','split')",
+            (batch_id,),
+        ).fetchall()]
+        if open_rounds:
+            raise DomainError(f"最终结论未生成，批次不能冻结，待决条目: {open_rounds}")
         missing = []
         for item in items:
             count = self.conn.execute(
@@ -422,4 +602,7 @@ class CorpusDB:
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "arbitration_rounds": [dict(r) for r in self.conn.execute("SELECT * FROM arbitration_rounds ORDER BY id")],
+            "arbitration_votes": [dict(r) for r in self.conn.execute("SELECT * FROM arbitration_votes ORDER BY id")],
+            "adjudications": [dict(r) for r in self.conn.execute("SELECT * FROM adjudications ORDER BY id")],
         }
