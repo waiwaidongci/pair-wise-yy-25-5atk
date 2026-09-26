@@ -53,6 +53,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 3 and parts[:2] == ["api", "items"]:
                 user_id = int(parse_qs(parsed.query).get("user_id", [0])[0])
                 return self._json(200, self.db.get_item_for_user(int(parts[2]), user_id))
+            if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "votes":
+                return self._json(200, self.db.adjudication_votes(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "disagreements":
                 return self._json(200, {"disagreements": self.db.disagreements(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "consistency":
@@ -80,7 +82,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/annotations":
                 return self._json(201, {"ok": True, "id": self.db.submit_annotation(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)), str(body.get("label", "")), str(body.get("comment", "")))})
             if path == "/api/adjudications":
-                return self._json(201, {"ok": True, "id": self.db.adjudicate(int(body.get("item_id", 0)), str(body.get("final_label", "")), str(body.get("reason", "")), int(body.get("arbitrator_id", 0)))})
+                label = str(body.get("label") or body.get("final_label") or "")
+                result = self.db.submit_adjudication_vote(int(body.get("item_id", 0)), int(body.get("arbitrator_id", 0)), label, str(body.get("reason", "")))
+                return self._json(201, {"ok": True, **result})
             if path == "/api/discussions":
                 return self._json(201, {"ok": True, "id": self.db.add_discussion(int(body.get("item_id", 0)), int(body.get("author_id", 0)), str(body.get("body", "")), bool(body.get("contains_answer", False)))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "freeze":
